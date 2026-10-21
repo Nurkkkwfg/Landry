@@ -3,3 +3,6 @@
 *.db-*
 .venv/
 __pycache__/
+serviceAccount*.json
+*-firebase-adminsdk-*.json
+*.json.gz
