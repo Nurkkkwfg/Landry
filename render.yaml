@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: laundry-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DGIS_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////var/data/laundry.db
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
