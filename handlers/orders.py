@@ -3,10 +3,12 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
 
 import geo
-from common import ACTIVE, ADMIN, DISPATCHER, MENU, STATUS, Role, card, esc, norm_phone, notify, spawn
+from common import (
+    ACTIVE, ADMIN, CANCELLABLE, DISPATCHER, MENU, STATUS, Role, card, esc, history_text, norm_phone, notify,
+    order_changed, retire_cards, safe_send, spawn, status_event,
+)
 from db import Order
 
 router = Router(name="orders")
@@ -36,28 +38,24 @@ class Find(StatesGroup):
     q = State()
 
 
-def kb_order(o: Order) -> InlineKeyboardMarkup | None:
-    if o.status not in ACTIVE:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [Btn(text="🗺 2ГИС", url=geo.map_url(o.address, o.lat, o.lon))],
-            [
-                Btn(text="✏️ Изменить", callback_data=f"oe:{o.id}"),
-                Btn(text="❌ Отменить", callback_data=f"oc:{o.id}"),
-            ]
-        ]
-    )
+def kb_order(o: Order) -> InlineKeyboardMarkup:
+    rows = []
+    if o.status in ACTIVE:
+        rows.append([Btn(text="🗺 2ГИС", url=geo.map_url(o.address, o.lat, o.lon))])
+        btns = [Btn(text="✏️ Изменить", callback_data=f"oe:{o.id}")]
+        if o.status in CANCELLABLE:
+            btns.append(Btn(text="❌ Отменить", callback_data=f"oc:{o.id}"))
+        rows.append(btns)
+    rows.append([Btn(text="📜 История", callback_data=f"oh:{o.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show(target: Message, o: Order, prefix: str = ""):
     await target.answer(prefix + card(o, f" · {STATUS[o.status]}"), reply_markup=kb_order(o))
 
 
-async def create(m: Message, db, bot: Bot, name: str, phone: str, address: str, lat=None, lon=None):
-    o = Order(name=name.strip(), phone=phone, address=address.strip(), lat=lat, lon=lon)
-    db.add(o)
-    await db.commit()
+async def create(m: Message, db, bot: Bot, who, name: str, phone: str, address: str, lat=None, lon=None):
+    o = await db.create_order(name, phone, address, lat, lon, actor_id=who.id, actor_name=who.full_name)
     spawn(notify(bot, o.id))  # карточка курьерам на смене — в фоне
     await show(m, o, "✅ Создан\n")
 
@@ -85,7 +83,7 @@ async def got_contact(m: Message, state: FSMContext, db, bot: Bot):
     if not phone:
         await m.answer("Неверный номер. Пример: 0700123456")
         return
-    last = await db.scalar(select(Order).where(Order.phone == phone).order_by(Order.id.desc()).limit(1))
+    last = await db.last_by_phone(phone)
     await state.update_data(phone=phone, oid=None)
     if last:
         await state.update_data(name=last.name, address=last.address, lat=last.lat, lon=last.lon)
@@ -107,7 +105,7 @@ async def same(c: CallbackQuery, state: FSMContext, db, bot: Bot):
     await state.clear()
     await c.message.edit_reply_markup()
     await c.answer()
-    await create(c.message, db, bot, d["name"], d["phone"], d["address"], d.get("lat"), d.get("lon"))
+    await create(c.message, db, bot, c.from_user, d["name"], d["phone"], d["address"], d.get("lat"), d.get("lon"))
 
 
 @router.callback_query(New.contact, F.data == "no:new")
@@ -155,20 +153,22 @@ async def ask_detail(m: Message, state: FSMContext, label: str, lat, lon):
     await m.answer(f"📌 <b>{esc(label)}</b>\n🏢 Подъезд / этаж / кв. (например: п.2 эт.5 кв.20)", reply_markup=kb)
 
 
-async def finish_address(m: Message, state: FSMContext, db, bot: Bot, detail: str | None):
+async def finish_address(m: Message, state: FSMContext, db, bot: Bot, who, detail: str | None):
     d = await state.get_data()
     await state.clear()
     address = d["label"] + (f", {detail}" if detail else "")
     if d.get("oid"):
-        o = await db.get(Order, d["oid"])
+        o = await db.update_fields(
+            d["oid"], {"address": address, "lat": d.get("lat"), "lon": d.get("lon")},
+            who.id, who.full_name, "изменён адрес",
+        )
         if o is None:
-            await m.answer("Заказ не найден")
+            await m.answer("Заказ не найден или уже закрыт — изменить нельзя")
             return
-        o.address, o.lat, o.lon = address, d.get("lat"), d.get("lon")
-        await db.commit()
         await show(m, o, "✅ Адрес изменён\n")
+        spawn(order_changed(bot, o))
     else:
-        await create(m, db, bot, d["name"], d["phone"], address, d.get("lat"), d.get("lon"))
+        await create(m, db, bot, who, d["name"], d["phone"], address, d.get("lat"), d.get("lon"))
 
 
 @router.message(Addr.query, NOT_MENU)
@@ -209,14 +209,14 @@ async def addr_pick(c: CallbackQuery, state: FSMContext):
 @router.message(Addr.detail, NOT_MENU)
 async def addr_detail(m: Message, state: FSMContext, db, bot: Bot):
     t = (m.text or "").strip()
-    await finish_address(m, state, db, bot, None if t in {"", "-", "—"} else t)
+    await finish_address(m, state, db, bot, m.from_user, None if t in {"", "-", "—"} else t)
 
 
 @router.callback_query(Addr.detail, F.data == "ad:skip")
 async def addr_skip(c: CallbackQuery, state: FSMContext, db, bot: Bot):
     await c.answer()
     await c.message.edit_reply_markup()
-    await finish_address(c.message, state, db, bot, None)
+    await finish_address(c.message, state, db, bot, c.from_user, None)
 
 
 # ---------- список / поиск ----------
@@ -225,9 +225,13 @@ def row(o: Order) -> list[Btn]:
 
 
 async def list_view(db, hist: bool, offset: int):
-    cond = Order.status.not_in(ACTIVE) if hist else Order.status.in_(ACTIVE)
-    total = await db.scalar(select(func.count()).select_from(Order).where(cond))
-    orders = (await db.scalars(select(Order).where(cond).order_by(Order.id.desc()).offset(offset).limit(PAGE))).all()
+    if hist:
+        total = await db.archive_count()
+        orders = await db.archive_page(offset, PAGE)
+    else:
+        allo = sorted(await db.list_active(), key=lambda o: -o.id)
+        total = len(allo)
+        orders = allo[offset : offset + PAGE]
     h = "1" if hist else "0"
     rows = [row(o) for o in orders]
     nav = []
@@ -259,10 +263,18 @@ async def orders_page(c: CallbackQuery, db):
 
 @router.callback_query(F.data.startswith("od:"))
 async def order_open(c: CallbackQuery, db):
-    o = await db.get(Order, int(c.data.split(":")[1]))
+    o = await db.get_order(int(c.data.split(":")[1]))
     await c.answer()
     if o:
         await show(c.message, o)
+
+
+@router.callback_query(F.data.startswith("oh:"))
+async def order_history(c: CallbackQuery, db):
+    o = await db.get_order(int(c.data.split(":")[1]))
+    await c.answer()
+    if o:
+        await c.message.answer(history_text(o))
 
 
 @router.message(F.text == "🔎 Поиск")
@@ -273,15 +285,7 @@ async def find_start(m: Message, state: FSMContext):
 
 
 async def search(m: Message, db, q: str):
-    q = q.strip().lstrip("#")
-    digits = "".join(ch for ch in q if ch.isdigit())
-    if q.isdigit() and len(q) <= 6:
-        cond = Order.id == int(q)
-    elif len(digits) >= 4:
-        cond = Order.phone.contains(digits[-9:])  # 0700123456 -> 700123456
-    else:
-        cond = Order.name.ilike(f"%{q}%")
-    found = (await db.scalars(select(Order).where(cond).order_by(Order.id.desc()).limit(10))).all()
+    found = await db.find_orders(q)
     if not found:
         await m.answer("Ничего не найдено")
     elif len(found) == 1:
@@ -314,21 +318,34 @@ async def cancel_ask(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("on:"))
 async def cancel_no(c: CallbackQuery, db):
-    o = await db.get(Order, int(c.data.split(":")[1]))
+    o = await db.get_order(int(c.data.split(":")[1]))
     await c.message.edit_reply_markup(reply_markup=kb_order(o) if o else None)
     await c.answer()
 
 
+async def after_cancel(bot: Bot, o: Order, actor) -> None:
+    if o.prev_status in ("new", "ready"):  # убрать карточки у курьеров
+        await retire_cards(bot, o.id, f"❌ <b>№{o.id}</b> отменён")
+    if o.courier_id and o.prev_status in ("picked", "delivering"):  # курьер, у которого заказ на руках
+        hint = "Не сдавайте его в цех." if o.prev_status == "picked" else "Не доставляйте клиенту."
+        await safe_send(bot, o.courier_id, f"❌ Заказ <b>№{o.id}</b> ({esc(o.name)}) отменён диспетчером. {hint}")
+    await status_event(bot, o, actor.full_name, exclude=actor.id)
+
+
 @router.callback_query(F.data.startswith("ok:"))
-async def cancel_do(c: CallbackQuery, db):
-    o = await db.get(Order, int(c.data.split(":")[1]))
-    if o is None or o.status not in ACTIVE:
-        await c.answer("Уже нельзя отменить", show_alert=True)
+async def cancel_do(c: CallbackQuery, db, bot: Bot):
+    oid = int(c.data.split(":")[1])
+    o = await db.transition(oid, CANCELLABLE, "cancelled", c.from_user.id, c.from_user.full_name)
+    if o is None:
+        cur = await db.get_order(oid)
+        msg = "Заказ в цехе — отменить нельзя" if cur and cur.status == "shop" else "Уже нельзя отменить"
+        await c.answer(msg, show_alert=True)
+        if cur:
+            await c.message.edit_reply_markup(reply_markup=kb_order(cur))
         return
-    o.status = "cancelled"
-    await db.commit()
-    await c.message.edit_text(card(o, f" · {STATUS['cancelled']}"))
+    await c.message.edit_text(card(o, f" · {STATUS['cancelled']}"), reply_markup=kb_order(o))
     await c.answer("Отменён")
+    spawn(after_cancel(bot, o, c.from_user))
 
 
 # ---------- изменение ----------
@@ -346,8 +363,12 @@ async def edit_menu(c: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("of:"))
-async def edit_field(c: CallbackQuery, state: FSMContext):
+async def edit_field(c: CallbackQuery, state: FSMContext, db):
     _, oid, k = c.data.split(":")
+    o = await db.get_order(int(oid))
+    if o is None or o.status not in ACTIVE:
+        await c.answer("Заказ уже закрыт — изменить нельзя", show_alert=True)
+        return
     await state.update_data(oid=int(oid), k=k)
     await c.answer()
     if k == "a":
@@ -360,9 +381,8 @@ async def edit_field(c: CallbackQuery, state: FSMContext):
 @router.message(Edit.value, NOT_MENU)
 async def edit_save(m: Message, state: FSMContext, db, bot: Bot):
     d = await state.get_data()
-    o = await db.get(Order, d["oid"])
     value = (m.text or "").strip()
-    field = FIELDS[d["k"]][0]
+    field, label = FIELDS[d["k"]]
     if field == "phone":
         value = norm_phone(value)
         if not value:
@@ -372,9 +392,9 @@ async def edit_save(m: Message, state: FSMContext, db, bot: Bot):
         await m.answer("Введите текстом")
         return
     await state.clear()
+    o = await db.update_fields(d["oid"], {field: value}, m.from_user.id, m.from_user.full_name, f"изменено: {label}")
     if o is None:
-        await m.answer("Заказ не найден")
+        await m.answer("Заказ не найден или уже закрыт — изменить нельзя")
         return
-    setattr(o, field, value)
-    await db.commit()
     await show(m, o, "✅ Изменено\n")
+    spawn(order_changed(bot, o))  # курьер увидит правку

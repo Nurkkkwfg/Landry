@@ -5,9 +5,8 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message
-from sqlalchemy import select, update
 
-from common import LAUNDRY, MENU, STATUS, Role, card, notify, spawn
+from common import LAUNDRY, MENU, STATUS, Role, card, notify, spawn, status_event
 from db import Order
 
 router = Router(name="laundry")
@@ -42,7 +41,7 @@ async def show(m: Message, o: Order):
 @router.message(F.text == "🧼 В цехе")
 async def in_work(m: Message, state: FSMContext, db):
     await state.clear()
-    orders = (await db.scalars(select(Order).where(Order.status == "shop").order_by(Order.id))).all()
+    orders = sorted(await db.by_status(("shop",)), key=lambda o: o.id)
     if not orders:
         await m.answer("📭 В прачечной пусто")
         return
@@ -52,7 +51,7 @@ async def in_work(m: Message, state: FSMContext, db):
 
 @router.callback_query(F.data.startswith("lo:"))
 async def open_(c: CallbackQuery, db):
-    o = await db.get(Order, int(c.data.split(":")[1]))
+    o = await db.get_order(int(c.data.split(":")[1]))
     await c.answer()
     if o:
         await show(c.message, o)
@@ -67,7 +66,7 @@ async def ask(m: Message, state: FSMContext):
 
 async def find(m: Message, db):
     q = (m.text or "").strip().lstrip("#")
-    o = await db.get(Order, int(q)) if q.isdigit() and len(q) <= 9 else None
+    o = await db.get_order(int(q)) if q.isdigit() and len(q) <= 9 else None
     if o is None:
         await m.answer("Заказ не найден")
     else:
@@ -148,24 +147,25 @@ async def got_curtains(m: Message, state: FSMContext, db):
         n = int(mm.group())
     d = await state.get_data()
     await state.clear()
-    await db.execute(
-        update(Order).where(Order.id == d["oid"], Order.status == "shop").values(measurements=build(d["carpets"], n))
-    )
-    await db.commit()
-    o = await db.get(Order, d["oid"])
-    if o:
-        await show(m, o)
+    o = await db.set_measurements(d["oid"], build(d["carpets"], n), m.from_user.id, m.from_user.full_name)
+    if o is None:  # раньше здесь был молчаливый «успех»
+        await m.answer("⚠️ Замеры НЕ сохранены: статус заказа изменился (он уже не в цехе).")
+        cur = await db.get_order(d["oid"])
+        if cur:
+            await show(m, cur)
+        return
+    await m.answer("✅ Замеры сохранены")
+    await show(m, o)
 
 
 @router.callback_query(F.data.startswith("lr:"))
 async def ready(c: CallbackQuery, db, bot: Bot):
     oid = int(c.data.split(":")[1])
-    r = await db.execute(update(Order).where(Order.id == oid, Order.status == "shop").values(status="ready"))
-    await db.commit()
-    if r.rowcount != 1:
+    o = await db.transition(oid, ("shop",), "ready", c.from_user.id, c.from_user.full_name)
+    if o is None:
         await c.answer("Статус уже изменён", show_alert=True)
         return
-    o = await db.get(Order, oid)
     await c.message.edit_text(card(o, f" · {STATUS['ready']}"))
     await c.answer("Готово")
     spawn(notify(bot, oid))  # курьерам на смене — «взять на доставку»
+    spawn(status_event(bot, o, c.from_user.full_name))
