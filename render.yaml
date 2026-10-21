@@ -14,9 +14,6 @@ services:
         sync: false
       - key: DGIS_KEY
         sync: false
-      - key: DATABASE_URL
-        value: sqlite+aiosqlite:////var/data/laundry.db
-    disk:
-      name: data
-      mountPath: /var/data
-      sizeGB: 1
+      # JSON сервисного аккаунта Firebase одной строкой — вставляется в панели Render, не в git
+      - key: FIREBASE_CREDENTIALS
+        sync: false

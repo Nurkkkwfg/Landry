@@ -4,7 +4,6 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message
-from sqlalchemy import select
 
 from common import ADMIN, ROLE_CACHE, ROLE_NAMES, Role, esc, menu
 from config import ADMIN_IDS
@@ -29,11 +28,10 @@ async def start(m: Message, db, bot: Bot, state: FSMContext, role: str | None):
         await m.answer("Меню 👇", reply_markup=menu(role))
         return
     p = m.from_user
-    if await db.get(User, p.id):
+    if await db.get_user(p.id):
         await m.answer("⏳ Заявка уже отправлена, ждите одобрения.")
         return
-    db.add(User(id=p.id, username=p.username, full_name=p.full_name))
-    await db.commit()
+    await db.create_user(User(id=p.id, username=p.username, full_name=p.full_name))
     kb = InlineKeyboardMarkup(
         inline_keyboard=role_buttons(p.id) + [[Btn(text="🚫 Отклонить", callback_data=f"st:del:{p.id}")]]
     )
@@ -64,7 +62,7 @@ async def cancel(m: Message, state: FSMContext, role: str | None):
 @admin_router.message(F.text == "👥 Сотрудники")
 async def staff(m: Message, db, state: FSMContext):
     await state.clear()
-    users = (await db.scalars(select(User).order_by(User.approved, User.full_name))).all()
+    users = sorted(await db.list_users(), key=lambda u: (u.approved, u.full_name))
     users = [u for u in users if u.id not in ADMIN_IDS]
     if not users:
         await m.answer("Сотрудников пока нет.")
@@ -80,7 +78,7 @@ async def staff(m: Message, db, state: FSMContext):
 @admin_router.callback_query(F.data.startswith("st:open:"))
 async def staff_open(c: CallbackQuery, db):
     uid = int(c.data.split(":")[2])
-    u = await db.get(User, uid)
+    u = await db.get_user(uid)
     if not u:
         await c.answer("Не найден", show_alert=True)
         return
@@ -95,14 +93,14 @@ async def staff_open(c: CallbackQuery, db):
 async def staff_set(c: CallbackQuery, db, bot: Bot):
     _, _, uid, r = c.data.split(":")
     uid = int(uid)
-    u = await db.get(User, uid)
+    u = await db.get_user(uid)
     if not u or r not in ROLE_NAMES:
         await c.answer("Не найден", show_alert=True)
         return
-    u.role, u.approved = r, True
+    changes = {"role": r, "approved": True}
     if r != "courier":
-        u.on_shift = False
-    await db.commit()
+        changes["on_shift"] = False
+    await db.update_user(uid, **changes)
     ROLE_CACHE.pop(uid, None)
     await c.message.edit_text(f"✅ {esc(u.full_name)} → {ROLE_NAMES[r]}")
     await c.answer("Готово")
@@ -115,13 +113,15 @@ async def staff_set(c: CallbackQuery, db, bot: Bot):
 @admin_router.callback_query(F.data.startswith("st:del:"))
 async def staff_del(c: CallbackQuery, db, bot: Bot):
     uid = int(c.data.split(":")[2])
-    u = await db.get(User, uid)
+    u = await db.get_user(uid)
     if u:
-        name = u.full_name
-        await db.delete(u)
-        await db.commit()
+        held = await db.held(uid) if u.role == "courier" else []
+        await db.delete_user(uid)
         ROLE_CACHE.pop(uid, None)
-        await c.message.edit_text(f"🚫 {esc(name)} — доступ закрыт")
+        text = f"🚫 {esc(u.full_name)} — доступ закрыт"
+        if held:
+            text += "\n⚠️ У него на руках заказы: " + ", ".join(f"№{o.id}" for o in held) + " — решите, что с ними делать."
+        await c.message.edit_text(text)
         try:
             await bot.send_message(uid, "Доступ закрыт.")
         except Exception:
